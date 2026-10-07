@@ -170,10 +170,10 @@ pub fn matches_achievement_all_data_notify(data: Vec<u8>) -> Option<Vec<Achievem
 // --- Heuristic thresholds for field-number-agnostic packet matching ---
 const MIN_ITEM_ENTRIES: usize = 10;
 const MIN_GEAR_COUNT: usize = 5;
-const MIN_AVATAR_ENTRIES: usize = 4;
-const MIN_AVATARS_WITH_PROPS: usize = 2;
-const MIN_AVATARS_WITH_SKILLS: usize = 2;
-const MIN_AVATARS_WITH_EQUIP: usize = 2;
+const MIN_AVATAR_ENTRIES: usize = 1;
+const MIN_AVATARS_WITH_PROPS: usize = 1;
+const MIN_AVATARS_WITH_SKILLS: usize = 1;
+const MIN_AVATARS_WITH_EQUIP: usize = 1;
 
 /// Extract the repeated field with the most entries that parse as `T` and pass
 /// the `filter`. Returns `(best_field_number, parsed_entries)`.
@@ -241,9 +241,13 @@ pub fn matches_items_all_data_notify(data: &[u8]) -> Option<Vec<Item>> {
 
 /// Field-number-agnostic avatar packet detection.
 ///
-/// Requires ≥4 avatars with non-empty `prop_map`, `skill_level_map`, and
-/// `equip_guid_list`. This filters out incremental packets (team changes,
-/// trial avatars) which lack skill/equip data.
+/// Requires at least one entry that parses as an `AvatarInfo` carrying a
+/// non-empty `prop_map`, plus skill and equip data on the same scale. A roster
+/// of one or two owned avatars is what a new account actually sends, so the
+/// counts cannot be raised to "looks like a big roster" without dropping those
+/// accounts; what keeps the incremental pushes (team changes, trial avatars,
+/// and unrelated packets whose repeated field happens to parse) out is the
+/// per-avatar content, not the list length.
 pub fn matches_avatars_all_data_notify(data: &[u8]) -> Option<Vec<AvatarInfo>> {
     let (_field, avatars) = find_best_field::<AvatarInfo>(data, MIN_AVATAR_ENTRIES, |a| {
         a.avatar_id != 0 && a.guid != 0
