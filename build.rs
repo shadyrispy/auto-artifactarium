@@ -1,15 +1,20 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 
-/// Merge every proto source file in `protos_src/` (minus imports, which become
-/// redundant once all types live in one file) into a single `protos.proto`,
-/// strip field options, and append the parser's local compatibility types.
+/// Build `protos/protos.proto` from the raw protocol dumps vendored in
+/// `protos_src/` (the gitlab kitkat-multiverse `genshin-protocol`
+/// `Deobfuscated.proto`, currently 7.1.0). The raw dump is normalized at build
+/// time so it type-checks standalone:
+///   * drop the `import`, the `YsCustom` option message, and the
+///     `extend google.protobuf.FieldOptions` block (its `ys_custom` option is
+///     stripped from field lines)
+///   * normalize `// CmdId: n | MergeFrom: ..` comments to `// CmdId: n`,
+///     dropping `CmdId: -` placeholders, so the cmd_id map can be derived
+///   * drop the dump's partial `PacketHead`; the full client layout is appended
+///   * rename Reliquary's client-side fields 6..8 to the names the exporter
+///     reads, scoped to the Reliquary message
 ///
-/// `protos_src/all_7_1.proto` is generated from the gitlab kitkat-multiverse
-/// `genshin-protocol` 7.1.0 Deobfuscated dump by
-/// `scripts/convert_genshin_protocol_dump.py`.
-///
-/// A single source file makes `protobuf_codegen` emit its content in one
+/// A single merged file makes `protobuf_codegen` emit everything in one
 /// `protos` module, so existing `crate::gen::protos::*` references keep working.
 fn main() {
     let proto_dir = "protos_src";
@@ -27,38 +32,10 @@ fn main() {
     let mut merged = String::new();
     for f in &inputs {
         let raw = fs::read_to_string(f).unwrap();
-        for line in raw.lines() {
-            let t = line.trim_start();
-            // Inline imports (now redundant) and per-file header repeats.
-            if t.starts_with("import ")
-                || t.starts_with("option ")
-                || t.starts_with("package ")
-            {
-                continue;
-            }
-            // Keep exactly one `syntax` declaration at the top of the merged
-            // file; drop any others.
-            if t.starts_with("syntax ") {
-                if *syntax_seen {
-                    continue;
-                }
-                *syntax_seen = true;
-            }
-            merged.push_str(line.trim_end());
-            merged.push('\n');
-        }
+        normalize_dump(&raw, &mut merged, syntax_seen);
         merged.push('\n');
     }
-    // Strip mask options from merged text.
-    let cleaned = strip_mask(&merged);
-    // `extend google.protobuf.FieldOptions { ... }` only defined the now-stripped
-    // `mask` option and pulls in google/protobuf/descriptor.proto, which is not
-    // vendored. Drop the block so the merged file type-checks standalone.
-    let cleaned = drop_extend_field_options(&cleaned);
-    // The upstream Starlight dump strips three client-side `Reliquary` fields
-    // that `irminsul`'s player-data exporter needs. Their field numbers 6..8
-    // are unused by upstream, so re-inject them safely.
-    let cleaned = restore_reliquary_fields(&cleaned);
+    let cleaned = merged;
 
     fs::create_dir_all("protos").unwrap();
     // Append the parser's local compatibility types (not present in upstream
@@ -224,98 +201,95 @@ fn extract_blocks(src: &str, needed: &std::collections::BTreeSet<String>) -> Str
     out
 }
 
-fn strip_mask(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    for line in src.split_inclusive('\n') {
-        let had_nl = line.ends_with('\n');
-        let content = if had_nl { &line[..line.len() - 1] } else { line };
-        let mut work = content.to_string();
-        loop {
-            if let Some(start) = work.find("[mask =") {
-                if let Some(rel) = work[start..].find(']') {
-                    let end = start + rel;
-                    let mut tail = work[end + 1..].to_string();
-                    while tail.starts_with(' ') {
-                        tail.remove(0);
-                    }
-                    work = format!("{}{}", &work[..start], tail);
-                    continue;
-                }
-            }
-            break;
-        }
-        out.push_str(&work);
-        if had_nl {
-            out.push('\n');
-        }
+/// Normalize one raw `genshin-protocol` Deobfuscated dump into standalone
+/// proto text appended to `out`. Everything before the first `// CmdId`
+/// comment is dump header (import, YsCustom option message, FieldOptions
+/// extension) and dropped; exactly one `syntax` line is emitted overall.
+fn normalize_dump(raw: &str, out: &mut String, syntax_seen: &mut bool) {
+    let lines: Vec<&str> = raw.lines().collect();
+    let Some(mut i) = lines.iter().position(|l| l.starts_with("// CmdId")) else {
+        return;
+    };
+    if !*syntax_seen {
+        out.push_str("syntax = \"proto3\";\n\n");
+        *syntax_seen = true;
     }
-    out
-}
 
-/// Remove `extend google.protobuf.FieldOptions { ... }` blocks, whose custom
-/// `mask` option was already stripped, so the merged proto no longer depends on
-/// the not-vendored `google/protobuf/descriptor.proto`.
-fn drop_extend_field_options(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut depth = 0i32;
-    let mut skipping = false;
-    for line in src.split_inclusive('\n') {
-        let had_nl = line.ends_with('\n');
-        let content = if had_nl { &line[..line.len() - 1] } else { line };
-        let t = content.trim_start();
-        if !skipping && t.starts_with("extend google.protobuf.FieldOptions") {
-            skipping = true;
-            depth = 0;
-        }
-        if skipping {
-            // Count braces to find the matching `}`.
-            for ch in content.chars() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-            }
-            if depth <= 0 && content.contains('}') {
-                skipping = false;
-            }
+    // Brace depth of the block currently being skipped, if any: the dump's
+    // partial PacketHead is skipped so the appended full layout is the only one.
+    let mut skip_depth: Option<i32> = None;
+    // Brace depth while inside `message Reliquary { ... }`.
+    let mut reliq_depth: Option<i32> = None;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let t = line.trim_start();
+
+        if skip_depth.is_some() {
+            let d = skip_depth.unwrap() + line.matches('{').count() as i32
+                - line.matches('}').count() as i32;
+            skip_depth = if d <= 0 { None } else { Some(d) };
+            i += 1;
             continue;
         }
-        out.push_str(content);
-        if had_nl {
-            out.push('\n');
+        if t.starts_with("message ") && decl_name(t) == Some("PacketHead") {
+            // The declaration line itself opens the block but is consumed here.
+            skip_depth = Some(1);
+            i += 1;
+            continue;
         }
+
+        if reliq_depth.is_none() && t.starts_with("message ") && decl_name(t) == Some("Reliquary")
+        {
+            reliq_depth = Some(0);
+        }
+
+        // Normalize the CmdId comment; drop `-` placeholders entirely.
+        if let Some(rest) = t.strip_prefix("// CmdId:") {
+            let id = rest.split('|').next().unwrap_or("").trim();
+            if id != "-" {
+                out.push_str(&format!("// CmdId: {id}\n"));
+            }
+            i += 1;
+            continue;
+        }
+
+        // Strip the inline custom field option: `... = n [(ys_custom)...];`.
+        let mut emitted = line.trim_end().to_string();
+        if let Some(open) = emitted.find("[(ys_custom)") {
+            if let Some(rel) = emitted[open..].find(']') {
+                emitted.replace_range(open..open + rel + 1, "");
+            }
+        }
+        if reliq_depth.is_some() {
+            emitted = rename_reliquary_field(&emitted);
+        }
+
+        out.push_str(&emitted);
+        out.push('\n');
+
+        if let Some(depth) = reliq_depth {
+            let d = depth + emitted.matches('{').count() as i32
+                - emitted.matches('}').count() as i32;
+            reliq_depth = if d <= 0 { None } else { Some(d) };
+        }
+        i += 1;
     }
-    out
 }
 
-/// Re-inject the client-side `Reliquary` fields that upstream's dump omitted.
-/// The exporter in `irminsul` reads `starred`/`elixer_choices`/
-/// `unactivated_prop_id_list`; upstream `Reliquary` only carries the 5 base
-/// fields (numbers 1..5), so numbers 6..8 are free to reuse.
-fn restore_reliquary_fields(src: &str) -> String {
-    let marker = "message Reliquary {";
-    let has_extra = src.contains("unactivated_prop_id_list");
-    if has_extra {
-        return src.to_string();
-    }
-    // Inject the extra fields right before the closing brace of the first
-    // top-level `message Reliquary { ... }` block.
-    let Some(pos) = src.find(marker) else {
-        return src.to_string();
-    };
-    let after = &src[pos + marker.len()..];
-    let Some(close_offset) = after.find("\n}") else {
-        return src.to_string();
-    };
-    let insert_at = pos + marker.len() + close_offset + 1; // before "}"
-    let extra = "\n  bool starred = 6;\n  repeated uint32 elixer_choices = 7;\n  repeated uint32 unactivated_prop_id_list = 8;\n";
-    let mut out = String::with_capacity(src.len() + extra.len());
-    out.push_str(&src[..insert_at]);
-    out.push_str(extra);
-    // Drop the newline marker we consumed.
-    out.push_str(&src[insert_at..]);
-    out
+/// The type name on a `message Name {` / `enum Name {` line.
+fn decl_name(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .nth(1)
+        .map(|n| n.trim_end_matches('{').trim())
+}
+
+/// Map the dump's underscore-prefixed Reliquary client fields (6..8) to the
+/// names the exporter reads. Only applied on lines inside `message Reliquary`.
+fn rename_reliquary_field(line: &str) -> String {
+    line.replace("_is_relic_starred", "starred")
+        .replace("_purchased_append_prop_id_list", "elixer_choices")
+        .replace("_definite_append_prop_id_list", "unactivated_prop_id_list")
 }
 
 /// Scan merged proto text for `// CmdId: N` comments and associate each with
