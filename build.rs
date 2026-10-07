@@ -1,31 +1,24 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 
-/// Merge every Starlight proto (minus imports, which become redundant once all
-/// types live in one file) into a single `protos.proto`, strip `[mask]` field
-/// options, and exclude the Base `cmd_gcg_common.proto` (superseded by V70's
-/// `cmd_gcg.proto`) to avoid duplicate type definitions.
+/// Merge every proto source file in `protos_src/` (minus imports, which become
+/// redundant once all types live in one file) into a single `protos.proto`,
+/// strip field options, and append the parser's local compatibility types.
+///
+/// `protos_src/all_7_1.proto` is generated from the gitlab kitkat-multiverse
+/// `genshin-protocol` 7.1.0 Deobfuscated dump by
+/// `scripts/convert_genshin_protocol_dump.py`.
 ///
 /// A single source file makes `protobuf_codegen` emit its content in one
 /// `protos` module, so existing `crate::gen::protos::*` references keep working.
 fn main() {
     let proto_dir = "protos_src";
     let out_proto = "protos/protos.proto";
-    // - cmd_gcg_common.proto: superseded by V70's cmd_gcg.proto (dup types)
-    // - extra.proto: server-infrastructure messages (PlayerPacketNotify etc.)
-    //   and its own PacketHead; the local PacketHead used by the parser is
-    //   appended below instead, avoiding a definition clash.
-    let exclude = ["cmd_gcg_common.proto", "extra.proto"];
-
     let mut inputs: Vec<String> = fs::read_dir(proto_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|x| x == "proto").unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| {
-            let n = p.file_name().unwrap().to_string_lossy().to_string();
-            !exclude.contains(&n.as_str())
-        })
         .map(|p| p.display().to_string())
         .collect();
     inputs.sort();
@@ -133,7 +126,7 @@ fn main() {
     .unwrap();
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=protos_experiment/");
+    println!("cargo:rerun-if-changed=protos_src/");
     println!("cargo:rerun-if-changed=protos/protos.proto");
 }
 

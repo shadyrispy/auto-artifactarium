@@ -330,23 +330,23 @@ mod tests {
 
     #[test]
     fn a_batch_envelope_yields_its_inner_commands() {
-        // UnionCmdNotify { repeated UnionCmd cmd_list = 11 }
-        // UnionCmd   { uint32 message_id = 15; bytes body = 8 }
+        // 7.1 layout: UnionCmdNotify { repeated UnionCmd cmd_list = 8 }
+        // UnionCmd   { uint32 message_id = 13; bytes body = 6 }
         let item = |id: u32, body: &[u8]| -> Vec<u8> {
-            let mut out = vec![0x78];
+            let mut out = vec![0x68];
             out.extend(varint(id));
-            out.push(0x42);
+            out.push(0x32);
             out.push(body.len() as u8);
             out.extend_from_slice(body);
-            let mut envelope = vec![0x5a, out.len() as u8];
+            let mut envelope = vec![0x42, out.len() as u8];
             envelope.extend_from_slice(&out);
             envelope
         };
         let mut proto_data = item(2092, b"one");
-        proto_data.extend_from_slice(&item(6586, b"two"));
+        proto_data.extend_from_slice(&item(27799, b"two"));
 
         let cmd = GameCommand {
-            command_id: 7516,
+            command_id: 2246,
             header_len: 0,
             data_len: proto_data.len() as u32,
             proto_data,
@@ -358,14 +358,14 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].command_id, 2092);
         assert_eq!(children[0].proto_data, b"one");
-        assert_eq!(children[1].command_id, 6586);
+        assert_eq!(children[1].command_id, 27799);
         assert_eq!(children[1].direction, PacketDirection::Received);
 
         // And the rendered body carries them, so one detail view shows the batch.
         let json = cmd.to_json();
         assert_eq!(json["name"], "UnionCmdNotify");
         assert_eq!(json["children"].as_array().unwrap().len(), 2);
-        assert_eq!(json["children"][1]["cmd_id"], 6586);
+        assert_eq!(json["children"][1]["cmd_id"], 27799);
     }
 
     #[test]
@@ -402,7 +402,7 @@ mod tests {
         body.owned_costume_list.push(1);
         let bytes = Message::write_to_bytes(&body).unwrap();
         let cmd = GameCommand {
-            command_id: 6586,
+            command_id: 27799,
             header_len: 0,
             data_len: bytes.len() as u32,
             proto_data: bytes,
@@ -432,7 +432,7 @@ mod tests {
 
         let bytes = Message::write_to_bytes(&body).unwrap();
         let cmd = GameCommand {
-            command_id: 6586,
+            command_id: 27799,
             header_len: 0,
             data_len: bytes.len() as u32,
             proto_data: bytes,
@@ -441,7 +441,7 @@ mod tests {
         };
 
         let json = cmd.to_json();
-        assert_eq!(json["cmd_id"], 6586);
+        assert_eq!(json["cmd_id"], 27799);
         assert_eq!(json["name"], "AvatarDataNotify");
         assert_eq!(json["direction"], "sent");
         assert_eq!(json["size"], cmd.proto_data.len() as u64);
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn known_cmd_garbage_bytes_yields_parse_error() {
         let cmd = GameCommand {
-            command_id: 6586,
+            command_id: 27799,
             header_len: 0,
             data_len: 5,
             proto_data: vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
